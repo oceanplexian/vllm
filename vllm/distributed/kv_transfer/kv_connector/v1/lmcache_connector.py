@@ -16,6 +16,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorBase_V1,
     KVConnectorMetadata,
     KVConnectorRole,
+    SupportsHMA,
 )
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionMetadata
@@ -69,7 +70,7 @@ class LMCacheKVEvents(KVConnectorKVEvents):
         return f"<LMCacheKVEvents events={self.get_all_events()}>"
 
 
-class LMCacheConnectorV1(KVConnectorBase_V1):
+class LMCacheConnectorV1(KVConnectorBase_V1, SupportsHMA):
     @classmethod
     def requires_piecewise_for_cudagraph(cls, extra_config: dict[str, Any]) -> bool:
         """
@@ -338,6 +339,21 @@ class LMCacheConnectorV1(KVConnectorBase_V1):
             returned by the engine.
         """
         return self._lmcache_engine.request_finished(request, block_ids)
+
+    def request_finished_all_groups(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """
+        Called when a request has finished for all kv cache groups (HMA).
+        Combines block IDs from all groups and delegates to the standard
+        request_finished handler.
+        """
+        combined_block_ids: list[int] = []
+        for group_blocks in block_ids:
+            combined_block_ids.extend(group_blocks)
+        return self._lmcache_engine.request_finished(request, combined_block_ids)
 
     def take_events(self) -> Iterable["KVCacheEvent"]:
         """

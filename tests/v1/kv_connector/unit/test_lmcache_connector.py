@@ -784,3 +784,24 @@ class TestIntegrationScenarios:
         assert aggregated_events[0].block_hashes == ["hash_common"]
         assert aggregated_events[0].parent_block_hash == "parent_common"
         assert aggregated_events[0].token_ids == [1, 2, 3]
+
+    def test_request_finished_all_groups(self, mock_connector):
+        """Test HMA support: block IDs from multiple groups are combined."""
+        mock_connector.request_finished_all_groups = (
+            LMCacheConnectorV1.request_finished_all_groups.__get__(
+                mock_connector, LMCacheConnectorV1
+            )
+        )
+        mock_connector._lmcache_engine.request_finished.return_value = (
+            False,
+            None,
+        )
+        request = MagicMock()
+        block_ids = ([1, 2, 3], [10, 11])
+
+        result = mock_connector.request_finished_all_groups(request, block_ids)
+
+        mock_connector._lmcache_engine.request_finished.assert_called_once_with(
+            request, [1, 2, 3, 10, 11]
+        )
+        assert result == (False, None)

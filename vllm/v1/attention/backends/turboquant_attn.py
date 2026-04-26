@@ -165,6 +165,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
         # not the model's actual head_dim. Accept any positive value.
         return head_size > 0
 
+    @classmethod
+    def supports_non_causal(cls) -> bool:
+        # Required for tree-style speculative decoding (e.g. DFlash) which
+        # runs the verify step with non-causal attention over the K+1
+        # candidate query tokens. The TurboQuant impl honours
+        # ``attn_metadata.causal`` in every code path.
+        return True
+
 
 @dataclass
 class TurboQuantMetadata(AttentionMetadata):
@@ -180,6 +188,7 @@ class TurboQuantMetadata(AttentionMetadata):
     is_prefill: bool = False
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
+    causal: bool = True  # set to False for tree-style spec-decode verify (DFlash)
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -223,6 +232,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             is_prefill=(cam.max_query_len > 1),
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
+            causal=cam.causal,
         )
 
 
@@ -291,6 +301,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
+        causal: bool = True,
     ) -> torch.Tensor:
         # fa_utils.get_flash_attn_version() returns None on backends that
         # should not pass an explicit fa_version kwarg.
@@ -304,7 +315,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
                 softmax_scale=self.scale,
-                causal=True,
+                causal=causal,
             )
         return flash_attn_varlen_func(
             q=q,
@@ -315,7 +326,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
-            causal=True,
+            causal=causal,
             fa_version=self.fa_version,
         )
 
@@ -450,6 +461,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_query_len=1,
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
+                causal=attn_metadata.causal,
             )
             attn_out[:num_decode_tokens] = self._decode_attention(
                 q[:num_decode_tokens], kv_cache, decode_meta, Pi, centroids, PiT, layer
@@ -475,6 +487,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 max_query_len=attn_metadata.max_query_len,
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
+                causal=attn_metadata.causal,
             )
             k = key[:N].view(N, self.num_kv_heads, self.head_size)
             v = value[:N].view(N, self.num_kv_heads, self.head_size)
@@ -540,6 +553,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
     ) -> torch.Tensor:
         N, Hq, D = query.shape
 
+        causal = attn_metadata.causal
+
         # Fast path: use flash_attn for first-chunk prefills (all K/V in batch).
         # max_query_len == max_seq_len means no request has prior cached KV.
         # Both are Python ints — no GPU sync.
@@ -552,6 +567,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 cu_seqlens_k=attn_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.max_query_len,
                 max_seqlen_k=attn_metadata.max_query_len,
+                causal=causal,
             )
 
         # Continuation or no flash_attn: per-request attention.
@@ -599,6 +615,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         cu_seqlens_k=cu,
                         max_seqlen_q=q_len,
                         max_seqlen_k=q_len,
+                        causal=causal,
                     )
                 else:
                     q_t = q_seq.transpose(0, 1).contiguous()
@@ -608,7 +625,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         q_t,
                         k_t,
                         v_t,
-                        is_causal=True,
+                        is_causal=causal,
                         scale=self.scale,
                         enable_gqa=use_gqa,
                     ).transpose(0, 1)
@@ -620,14 +637,26 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # For large continuations, fall back to _continuation_prefill.
                 cached_len = seq_len - q_len
                 if q_len <= _CONTINUATION_DECODE_THRESHOLD:
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
-                    synth_seq_lens = torch.arange(
-                        cached_len + 1,
-                        seq_len + 1,
-                        device=query.device,
-                        dtype=attn_metadata.seq_lens.dtype,
-                    )
+                    # Fast path: treat each query as a decode request.
+                    # Causal:    each query sees only its own prefix
+                    #            (synth_seq_lens grows by 1 per query).
+                    # Non-causal (DFlash verify): every query sees the full
+                    #            context including all sibling queries
+                    #            (synth_seq_lens is constant = seq_len).
+                    if causal:
+                        synth_seq_lens = torch.arange(
+                            cached_len + 1,
+                            seq_len + 1,
+                            device=query.device,
+                            dtype=attn_metadata.seq_lens.dtype,
+                        )
+                    else:
+                        synth_seq_lens = torch.full(
+                            (q_len,),
+                            seq_len,
+                            device=query.device,
+                            dtype=attn_metadata.seq_lens.dtype,
+                        )
                     synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
                     out = triton_turboquant_decode_attention(
                         query=q_seq,
@@ -658,6 +687,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         seq_len,
                         Pi,
                         centroids,
+                        causal=causal,
                     )
                 output[q_start:q_end] = out.to(query.dtype)
 
@@ -675,11 +705,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         seq_len: int,
         Pi: torch.Tensor,
         centroids: torch.Tensor,
+        causal: bool = True,
     ) -> torch.Tensor:
         """Handle continuation chunk by dequanting cached K/V from TQ cache.
 
         Dequants previously cached K/V, concatenates with the current
-        chunk's raw K/V, then runs flash_attn with causal masking.
+        chunk's raw K/V, then runs flash_attn with the requested mask.
+        ``causal=False`` is used by tree-style spec-decode verify (DFlash)
+        where every query token attends to the full context, including
+        all sibling candidate tokens.
         """
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
@@ -759,7 +793,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_full = torch.cat([k_cached_trim.to(qdtype), key_chunk], dim=0)
         v_full = torch.cat([v_cached_trim.to(qdtype), val_chunk], dim=0)
 
-        # Attention: q_len queries attending to seq_len K/V with causal mask
+        # Attention: q_len queries attending to seq_len K/V.
         if _HAS_FLASH_ATTN:
             cu_seqlens_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
             cu_seqlens_k = torch.tensor([0, seq_len], device=device, dtype=torch.int32)
@@ -771,22 +805,27 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=q_len,
                 max_seqlen_k=seq_len,
+                causal=causal,
             )
         else:
-            # SDPA fallback: expand KV for GQA, build causal mask
+            # SDPA fallback: expand KV for GQA, build mask if causal.
             q_t = query.transpose(0, 1).unsqueeze(0)  # (1, Hq, q_len, D)
             k_t = k_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
             v_t = v_full.transpose(0, 1).unsqueeze(0)  # (1, Hk, seq_len, D)
-            # Build causal mask: query position p can attend to K position j
-            # where j <= cached_len + p (p is 0-indexed within chunk)
-            q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
-            k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
-            mask = k_pos <= q_pos  # (q_len, seq_len)
+            if causal:
+                # Causal mask: query position p can attend to K position j
+                # where j <= cached_len + p (p is 0-indexed within chunk).
+                q_pos = torch.arange(q_len, device=device).unsqueeze(1) + cached_len
+                k_pos = torch.arange(seq_len, device=device).unsqueeze(0)
+                attn_mask = k_pos <= q_pos  # (q_len, seq_len)
+            else:
+                # Non-causal: every query attends to all K (incl. siblings).
+                attn_mask = None
             out = F.scaled_dot_product_attention(
                 q_t,
                 k_t,
                 v_t,
-                attn_mask=mask,
+                attn_mask=attn_mask,
                 scale=self.scale,
                 enable_gqa=(Hk < Hq),
             )  # (1, Hq, q_len, D)

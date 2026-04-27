@@ -607,9 +607,13 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         else:
             seq_lens_list = attn_metadata.seq_lens.cpu().tolist()
 
-        # Pre-allocate cu_seqlens for single-request flash_attn calls
-        # to avoid per-request host→device tensor creation.
-        _cu_2 = torch.zeros(2, device=query.device, dtype=torch.int32)
+        # query_start_loc is on GPU; build per-request cu_seqlens via tensor
+        # subtraction so it stays a GPU tensor and the CUDA graph trace can
+        # record it without any host→device copy. Using
+        # `_cu_2[1] = python_int` would scribble a Python scalar into a GPU
+        # tensor and trip "Cannot copy between CPU and CUDA tensors during
+        # CUDA graph capture" — exactly what kills the dflash drafter run.
+        _qsl_gpu = query_start_loc
 
         for i in range(num_reqs):
             q_start = qsl[i]
@@ -626,8 +630,12 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             if q_len == seq_len:
                 # First-chunk prefill: all K/V are in the current batch.
                 if _HAS_FLASH_ATTN:
-                    _cu_2[1] = q_len
-                    cu = _cu_2
+                    # cu = [0, q_len] derived purely on-device:
+                    #   query_start_loc[i:i+2] - query_start_loc[i:i+1]
+                    # Subtraction broadcasts the start over both elements,
+                    # giving (0, end - start) = (0, q_len). No Python-int
+                    # → GPU copy, so this is safe inside graph capture.
+                    cu = _qsl_gpu[i : i + 2] - _qsl_gpu[i : i + 1]
                     out = self._flash_attn_varlen(
                         q=q_seq,
                         k=k_seq,

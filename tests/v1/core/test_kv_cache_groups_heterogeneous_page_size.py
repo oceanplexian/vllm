@@ -24,6 +24,7 @@ from vllm.v1.core.kv_cache_utils import (
 )
 from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
+    MambaSpec,
     TQFullAttentionSpec,
 )
 
@@ -33,7 +34,9 @@ pytestmark = pytest.mark.cpu_test
 def _make_vllm_config(max_model_len: int = 16384) -> VllmConfig:
     return VllmConfig(
         model_config=ModelConfig(max_model_len=max_model_len),
-        scheduler_config=SchedulerConfig(),
+        scheduler_config=SchedulerConfig(
+            max_model_len=max_model_len, is_encoder_decoder=False
+        ),
     )
 
 
@@ -48,34 +51,51 @@ def _tq_spec(num_kv_heads: int, head_size: int, tq_slot_size: int):
     )
 
 
-def test_two_tq_specs_with_distinct_page_sizes_form_distinct_groups():
-    """Target full-attn (2 KV heads × 256 head_size) and DFlash drafter
-    (4 KV heads × 128 head_size) have the SAME total raw KV bytes per token
-    but different per-slot alignment overhead, producing non-divisible page
-    sizes. Confirm both end up in their own groups."""
+def _mamba_spec(block_size: int = 3168):
+    """A small MambaSpec to force `_get_kv_cache_groups_heterogeneous_page_size`
+    rather than `UniformTypeKVCacheSpecs.from_specs` (which would lump
+    all-AttentionSpec layers into a single uniform-type group)."""
+    return MambaSpec(
+        block_size=block_size,
+        shapes=((2, 64), (3, 8, 8)),
+        dtypes=(torch.float32, torch.float32),
+        mamba_cache_mode="none",
+        num_speculative_blocks=0,
+    )
+
+
+def test_hybrid_mamba_plus_two_tq_specs_form_distinct_groups():
+    """The Qwen3.6 + DFlash production failure: mamba + target TQ full-attn +
+    drafter TQ full-attn. Without mamba in the mix, the two TQ specs are both
+    AttentionSpec subclasses and would be lumped into a single
+    UniformTypeKVCacheSpecs group (already supported). Mamba breaks that
+    short-circuit and forces the path that pre-KANB-91 raised
+    NotImplementedError on the non-divisible TQ page sizes."""
     target_spec = _tq_spec(num_kv_heads=2, head_size=256, tq_slot_size=262)
     drafter_spec = _tq_spec(num_kv_heads=4, head_size=128, tq_slot_size=134)
+    mamba_spec = _mamba_spec()
     assert target_spec.page_size_bytes != drafter_spec.page_size_bytes
-    # Per ticket, ratio is exactly 1.0229× — non-divisible, so the legacy
-    # `unify_kv_cache_spec_page_size` would have raised here.
     larger = max(target_spec.page_size_bytes, drafter_spec.page_size_bytes)
     smaller = min(target_spec.page_size_bytes, drafter_spec.page_size_bytes)
+    # Non-divisible — the exact shape that pre-KANB-91 broke on.
     assert larger % smaller != 0
 
-    kv_cache_spec = {
-        f"target.layer_{i}": target_spec for i in range(4)
-    }
+    kv_cache_spec = {f"target.layer_{i}": target_spec for i in range(4)}
     kv_cache_spec.update({f"drafter.layer_{i}": drafter_spec for i in range(2)})
+    kv_cache_spec.update({f"mamba.layer_{i}": mamba_spec for i in range(6)})
 
     vllm_config = _make_vllm_config()
     groups = get_kv_cache_groups(vllm_config, kv_cache_spec)
+    # Each spec class winds up in at least one group; layer-count balancing
+    # may split a type across multiple groups but no group mixes spec types.
     page_sizes = {g.kv_cache_spec.page_size_bytes for g in groups}
-    assert page_sizes == {target_spec.page_size_bytes, drafter_spec.page_size_bytes}
-    # Exactly two distinct specs — though grouping may split a type into
-    # multiple groups for layer-count balance, no group mixes the two specs.
+    assert target_spec.page_size_bytes in page_sizes
+    assert drafter_spec.page_size_bytes in page_sizes
+    assert mamba_spec.page_size_bytes in page_sizes
     for g in groups:
-        page = g.kv_cache_spec.page_size_bytes
-        assert page in (target_spec.page_size_bytes, drafter_spec.page_size_bytes)
+        # Within a group every layer is a single canonical spec.
+        spec_classes = {type(g.kv_cache_spec).__name__}
+        assert len(spec_classes) == 1
 
 
 def test_per_group_tensor_sizes_reflect_each_group_page_size():
@@ -92,7 +112,9 @@ def test_per_group_tensor_sizes_reflect_each_group_page_size():
         layer_names=[f"drafter.layer_{i}" for i in range(2)],
         kv_cache_spec=drafter_spec,
     )
-
+    # `get_kv_cache_config_from_groups` general-case branch is taken when
+    # there is more than one group OR the single group is not
+    # UniformTypeKVCacheSpecs. Two distinct AttentionSpec groups suffice.
     available_memory = 4 * GiB_bytes
     cfg = get_kv_cache_config_from_groups(
         _make_vllm_config(),

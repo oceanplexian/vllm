@@ -519,6 +519,7 @@ class Platform:
             FullAttentionSpec,
             MambaSpec,
             MLAAttentionSpec,
+            TQFullAttentionSpec,
             get_kv_quant_mode,
         )
 
@@ -526,14 +527,32 @@ class Platform:
         model_config = vllm_config.model_config
         parallel_config = vllm_config.parallel_config
 
-        if cache_config.cache_dtype == "auto":
+        is_turboquant = isinstance(
+            cache_config.cache_dtype, str
+        ) and cache_config.cache_dtype.startswith("turboquant_")
+
+        if cache_config.cache_dtype == "auto" or is_turboquant:
+            # TurboQuant stores quantized K+V in a custom slot layout but the
+            # underlying tensor is created with the model's compute dtype;
+            # ``STR_DTYPE_TO_TORCH_DTYPE`` does not contain the ``turboquant_*``
+            # keys.
             kv_cache_dtype = model_config.dtype
         else:
             kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # Compute attention page size for 1 token.
+        # The hybrid alignment relies on this value to pick a block_size that
+        # makes ``attn_page_size >= mamba_page_size``. We therefore have to
+        # use the *actual* spec class that will back the attention layers —
+        # TurboQuant in particular has a much smaller page-per-token than a
+        # plain BF16 FullAttentionSpec, so using the latter would pick a
+        # too-small block_size and the allocator (which sizes tensors from
+        # ``spec.page_size_bytes``) would pad up to mamba_page_size while
+        # the backend's ``get_kv_cache_shape`` keeps the TQ slot layout —
+        # producing a tensor-view shape mismatch later in
+        # ``_reshape_kv_cache_tensors``.
         if model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
@@ -541,6 +560,22 @@ class Platform:
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
+            ).page_size_bytes
+        elif is_turboquant:
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+            )
+
+            tq_config = TurboQuantConfig.from_cache_dtype(
+                cache_config.cache_dtype,
+                model_config.get_head_size(),
+            )
+            attn_page_size_1_token = TQFullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                tq_slot_size=tq_config.slot_size_aligned,
             ).page_size_bytes
         else:
             attn_page_size_1_token = FullAttentionSpec(

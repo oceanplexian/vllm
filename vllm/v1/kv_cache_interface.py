@@ -602,7 +602,9 @@ class KVCacheConfig:
     """
 
     num_blocks: int
-    """The number of KV cache blocks"""
+    """The number of KV cache blocks. With heterogeneous page sizes across
+    groups (see `num_blocks_per_group`), this is the max across groups; legacy
+    consumers that read a single num_blocks see a sensible aggregate."""
     kv_cache_tensors: list[KVCacheTensor]
     """How should model runner initialize the KV cache tensors for each layer"""
     kv_cache_groups: list[KVCacheGroupSpec]
@@ -613,6 +615,19 @@ class KVCacheConfig:
     For models with multiple types of attention, there will be multiple groups,
     see `_get_kv_cache_config_uniform_page_size` for more details.
     """
+    num_blocks_per_group: tuple[int, ...] | None = None
+    """Per-group num_blocks, parallel to ``kv_cache_groups``. When set, each
+    group owns its own ``BlockPool`` sized by its entry here, enabling
+    heterogeneous page sizes across groups (e.g., a TurboQuant target layer
+    set + a DFlash drafter with different head configs).
+    When None (legacy uniform path), every group implicitly uses ``num_blocks``."""
+
+    def get_num_blocks(self, group_idx: int) -> int:
+        """Per-group block count. Falls back to ``num_blocks`` when
+        ``num_blocks_per_group`` is unset (legacy uniform path)."""
+        if self.num_blocks_per_group is None:
+            return self.num_blocks
+        return self.num_blocks_per_group[group_idx]
 
     @property
     def has_mamba_layers(self) -> bool:

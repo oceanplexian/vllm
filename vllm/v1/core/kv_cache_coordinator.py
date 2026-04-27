@@ -46,20 +46,32 @@ class KVCacheCoordinator(ABC):
         self.max_model_len = max_model_len
         self.enable_caching = enable_caching
 
-        self.block_pool = BlockPool(
-            kv_cache_config.num_blocks,
-            enable_caching,
-            hash_block_size,
-            enable_kv_cache_events,
-            metrics_collector,
+        # One BlockPool per group. With heterogeneous page sizes (KANB-91), a
+        # single shared pool would force every group's tensors to share a byte
+        # layout — which is the assumption that breaks for TurboQuant target +
+        # non-TQ drafter setups. Per-group pools let each group own a logical
+        # block-id space sized to its own demand, with no cross-group aliasing.
+        self.block_pools = tuple(
+            BlockPool(
+                kv_cache_config.get_num_blocks(i),
+                enable_caching,
+                hash_block_size,
+                enable_kv_cache_events,
+                metrics_collector,
+            )
+            for i in range(len(kv_cache_config.kv_cache_groups))
         )
+        # `block_pool` retained as a "primary" reference for legacy single-pool
+        # call sites that don't (yet) thread a group_id through. New code paths
+        # should index ``self.block_pools`` directly.
+        self.block_pool = self.block_pools[0] if self.block_pools else None
 
         # Needs special handling for find_longest_cache_hit if eagle is enabled
         self.use_eagle = use_eagle
         self.single_type_managers = tuple(
             get_manager_for_kv_cache_spec(
                 kv_cache_spec=kv_cache_group.kv_cache_spec,
-                block_pool=self.block_pool,
+                block_pool=self.block_pools[i],
                 enable_caching=enable_caching,
                 kv_cache_group_id=i,
                 dcp_world_size=dcp_world_size,

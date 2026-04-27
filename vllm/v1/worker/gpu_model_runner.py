@@ -6847,10 +6847,20 @@ class GPUModelRunner(
                 for group in self.kv_cache_config.kv_cache_groups
             ]
         )
-        num_groups = len(self.kv_cache_config.kv_cache_groups)
-        self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks // num_groups
-        ) * min_block_size
+        # KANB-91: per-group pools mean tokens-per-request is bounded by the
+        # smallest pool — every concurrent request consumes blocks from every
+        # group simultaneously. With the historical uniform-page layout this
+        # collapses to the previous `num_blocks // num_groups * min_block_size`
+        # formula (each per-group pool was sized at the old shared-pool size
+        # divided by num_groups).
+        if self.kv_cache_config.kv_cache_groups:
+            min_num_blocks = min(
+                self.kv_cache_config.get_num_blocks(i)
+                for i in range(len(self.kv_cache_config.kv_cache_groups))
+            )
+        else:
+            min_num_blocks = self.kv_cache_config.num_blocks
+        self.max_num_kv_tokens = min_num_blocks * min_block_size
         dcp_size = self.vllm_config.parallel_config.decode_context_parallel_size
         pcp_size = self.vllm_config.parallel_config.prefill_context_parallel_size
         if pcp_size * dcp_size > 1:

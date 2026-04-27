@@ -804,20 +804,28 @@ def get_max_concurrency_for_kv_cache_config(
 ) -> float:
     """
     Get the maximum concurrency for the given KV cache configuration.
+
+    KANB-91: with per-group pools, each group is independently capacity-bound.
+    Concurrency is the minimum across groups of (pool_size /
+    blocks_per_request_for_this_group), since every concurrent request needs
+    space in every pool simultaneously.
     """
-    num_layer_per_group = max(
-        len(group.layer_names) for group in kv_cache_config.kv_cache_groups
-    )
-    max_memory_usage_per_request = num_layer_per_group * max_memory_usage_bytes(
-        vllm_config, (group.kv_cache_spec for group in kv_cache_config.kv_cache_groups)
-    )
-    memory_per_block = (
-        kv_cache_config.kv_cache_groups[0].kv_cache_spec.page_size_bytes
-        * num_layer_per_group
-    )
-    num_block_per_request = cdiv(max_memory_usage_per_request, memory_per_block)
-    max_concurrency = kv_cache_config.num_blocks / num_block_per_request
-    return max_concurrency
+    if not kv_cache_config.kv_cache_groups:
+        return 0.0
+    per_group_concurrency: list[float] = []
+    for i, group in enumerate(kv_cache_config.kv_cache_groups):
+        spec = group.kv_cache_spec
+        blocks_per_request = cdiv(
+            spec.max_memory_usage_bytes(vllm_config), spec.page_size_bytes
+        )
+        if blocks_per_request <= 0:
+            continue
+        per_group_concurrency.append(
+            kv_cache_config.get_num_blocks(i) / blocks_per_request
+        )
+    if not per_group_concurrency:
+        return 0.0
+    return min(per_group_concurrency)
 
 
 def may_override_num_blocks(
@@ -967,13 +975,14 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
-def _get_kv_cache_groups_uniform_page_size(
+def _get_kv_cache_groups_heterogeneous_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
     """
-    Generates the KV cache groups for hybrid models with multiple
-    attention types but still with a uniform page size (physical memory per
-    block per layer) for all layers.
+    Generates the KV cache groups for hybrid models with multiple attention
+    types. Layers are grouped by spec equality; each resulting group keeps its
+    natural ``page_size_bytes``. With per-group ``BlockPool`` instances
+    (KANB-91), groups no longer need to share a single page size.
 
     Detailed explanation about kv cache management of hybrid models:
     The layers in the models are repeated with some patterns, e.g., a model
@@ -996,10 +1005,10 @@ def _get_kv_cache_groups_uniform_page_size(
     attention layers. There are 3 layers in the pattern (1 * full, 2 * sw), so
     there are 3 kv_cache_groups, each of which represents 10 layers.
 
-    To simplify the implementation, we make the following assumptions:
-    1. Physical memory per block: Must be the same across all KV cache groups.
-    Breaking this assumption is non-trivial due to memory fragmentation concerns
-    when allocating blocks of different sizes.
+    Assumptions / invariants:
+    1. Physical memory per block may differ across groups (KANB-91). Each
+    group owns a private ``BlockPool`` so heterogeneous page sizes do not
+    cause memory aliasing.
     2. Tokens per block (block_size): Currently, we directly use
     `CacheConfig.block_size` for all layers. It can be extended to vary by KV
     cache group, but within each KV cache group, all layers must share the same
@@ -1113,6 +1122,7 @@ def get_kv_cache_config_from_groups(
             num_blocks=1,
             kv_cache_tensors=[],
             kv_cache_groups=kv_cache_groups,
+            num_blocks_per_group=(),
         )
 
     # Determine how model runners should initialize the KV cache tensors.
@@ -1136,42 +1146,66 @@ def get_kv_cache_config_from_groups(
             )
             for layer_name in kv_cache_groups[0].layer_names
         ]
+        num_blocks_per_group = (num_blocks,)
     else:
-        # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        # General case (KANB-91 per-group-pool layout):
+        # Each group owns its own BlockPool with `num_blocks` logical block-id
+        # slots. Within a group, layers share spec by construction, so we can
+        # keep the slot-sharing optimization that lets `group_size` tensors
+        # back `group_size`-many layers via the group's local block table.
+        # Across groups, tensors are NEVER shared — each group's tensors are
+        # sized for that group's natural page_size, and its block-id space is
+        # independent of every other group's. This is what enables a
+        # TurboQuant target group and a DFlash drafter group with different
+        # head configs (and therefore different page_size_bytes) to coexist.
+        #
+        # Memory budget:
+        #   total_bytes_per_block = Σ_g (page_size_g × len(group_g.layer_names))
+        #   num_blocks            = available_memory // total_bytes_per_block
+        # We give every group the same `num_blocks` so a single request — which
+        # touches one layer in every group — can fill its share of each pool
+        # without one group becoming the per-request bottleneck. This matches
+        # the historical effective tokens-per-request for the uniform-page
+        # case (verified algebraically: with uniform page size,
+        # num_blocks_new == num_blocks_old / num_groups, and per-pool addressing
+        # gives `num_blocks_new × block_size` tokens per request — the same
+        # number the old shared-pool layout reported as
+        # `num_blocks_old × block_size / num_groups`).
+        total_bytes_per_block = sum(
+            group.kv_cache_spec.page_size_bytes * len(group.layer_names)
+            for group in kv_cache_groups
+        )
+        assert total_bytes_per_block > 0, (
+            "kv_cache_groups must contain at least one layer"
+        )
+        num_blocks = int(available_memory // total_bytes_per_block)
+        num_blocks = max(num_blocks, 0)
+        num_blocks = may_override_num_blocks(
+            vllm_config, num_blocks, suppress_log=suppress_log
+        )
 
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
-        assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config,
-            group_size,
-            available_memory,
-            page_size,
-            suppress_log=suppress_log,
-        )
+        # Slot-sharing tensor layout, but scoped to a single group. Each group
+        # builds `group.layer_names` worth of tensors (one per layer in slot
+        # order), each sized `page_size_g × num_blocks`. With per-group pools,
+        # there is no cross-group `shared_by` aliasing.
         kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
-            )
+        for group in kv_cache_groups:
+            page_size = group.kv_cache_spec.page_size_bytes
+            for layer_name in group.layer_names:
+                kv_cache_tensors.append(
+                    KVCacheTensor(
+                        size=page_size * num_blocks,
+                        shared_by=[layer_name],
+                    )
+                )
+
+        num_blocks_per_group = tuple(num_blocks for _ in kv_cache_groups)
 
     return KVCacheConfig(
         num_blocks=num_blocks,
         kv_cache_tensors=kv_cache_tensors,
         kv_cache_groups=kv_cache_groups,
+        num_blocks_per_group=num_blocks_per_group,
     )
 
 
@@ -1269,15 +1303,13 @@ def get_kv_cache_groups(
         # same window size). Put all layers into one group.
         return _get_kv_cache_groups_uniform_type(uniform_spec)
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
-    return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    # KANB-91: previously called `unify_kv_cache_spec_page_size` to coerce
+    # every layer onto a single page_size_bytes. That assumption was the
+    # blocker for TurboQuant target + non-TQ drafter setups whose head
+    # configs produce non-divisible page sizes. With per-group BlockPools,
+    # each group keeps its natural page_size and gets its own pool sized
+    # for its own demand — no unification step required here.
+    return _get_kv_cache_groups_heterogeneous_page_size(kv_cache_spec)
 
 
 def generate_scheduler_kv_cache_config(
@@ -1286,9 +1318,12 @@ def generate_scheduler_kv_cache_config(
     """
     Generate the KV cache configuration for the scheduler.
     """
-    assert all(
-        [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
-    )
+    # KANB-91: per-group num_blocks must match across workers element-wise.
+    ref = kv_cache_configs[0]
+    ref_groups = ref.num_blocks_per_group
+    for cfg in kv_cache_configs:
+        assert cfg.num_blocks == ref.num_blocks
+        assert cfg.num_blocks_per_group == ref_groups
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
     cfg = copy.deepcopy(kv_cache_configs[0])
@@ -1316,12 +1351,19 @@ def _report_kv_cache_config(
         [group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups]
     )
 
-    # Log the KV cache size and maximum concurrency.
-    num_tokens = (
-        kv_cache_config.num_blocks
-        // len(kv_cache_config.kv_cache_groups)
-        * min_block_size
+    # KANB-91: with per-group pools, each group has its own private block-id
+    # space sized at `num_blocks_per_group[i]`. A single request consumes
+    # blocks from each group's pool independently, so tokens-per-request is
+    # bounded by the *smallest* per-group pool. The legacy
+    # `num_blocks // len(groups) * min_block_size` formula computed the same
+    # quantity for the uniform-page case (where every group had the same
+    # `num_blocks` and shared a pool sized at `num_blocks * num_groups`). With
+    # per-group pools the per-group pool size *is* `num_blocks_per_group[i]`.
+    min_num_blocks = min(
+        kv_cache_config.get_num_blocks(i)
+        for i in range(len(kv_cache_config.kv_cache_groups))
     )
+    num_tokens = min_num_blocks * min_block_size
     dcp_size = vllm_config.parallel_config.decode_context_parallel_size
     pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
     if pcp_size * dcp_size > 1:
@@ -1370,18 +1412,17 @@ def _max_memory_usage_bytes_from_groups(
             for spec in per_layer_specs.values()
         )
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
-    group_size = max(len(group.layer_names) for group in kv_cache_groups)
-    page_size = get_uniform_page_size(
-        [group.kv_cache_spec for group in kv_cache_groups]
-    )
-    blocks_needed = sum(
-        cdiv(group.kv_cache_spec.max_memory_usage_bytes(vllm_config), page_size)
+    # General case (KANB-91 per-group-pool layout): each group owns its own
+    # tensors sized for its own page_size_bytes. Memory at peak demand for a
+    # single max-length request = Σ_g page_size_g × len(group_g.layer_names) ×
+    # blocks_per_request_g, where blocks_per_request_g = ceil(max_model_len /
+    # block_size_g). Equivalently, sum each group's
+    # `max_memory_usage_bytes(vllm_config)` weighted by its layer count.
+    return sum(
+        group.kv_cache_spec.max_memory_usage_bytes(vllm_config)
+        * len(group.layer_names)
         for group in kv_cache_groups
     )
-
-    return group_size * page_size * blocks_needed
 
 
 def _estimate_max_model_len_from_groups(
@@ -1610,20 +1651,43 @@ def get_kv_cache_configs(
             )
         )
 
-    # Change the num_blocks of each rank to the smallest among all ranks.
-    # We also need to shrink the tensor size proportionally to avoid
-    # allocating unused memory.
-    min_num_blocks = min(
-        kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    # Change the per-group num_blocks of each rank to the smallest among all
+    # ranks. We also shrink each tensor size proportionally to avoid
+    # allocating unused memory. With KANB-91 per-group pools, sync happens
+    # group-wise so heterogeneous-page configs stay valid across ranks.
+    num_groups = (
+        len(kv_cache_configs[0].kv_cache_groups) if kv_cache_configs else 0
+    )
+    if num_groups > 0:
+        min_num_blocks_per_group = tuple(
+            min(cfg.get_num_blocks(i) for cfg in kv_cache_configs)
+            for i in range(num_groups)
+        )
+    else:
+        min_num_blocks_per_group = ()
+    min_num_blocks_total = (
+        max(min_num_blocks_per_group) if min_num_blocks_per_group else 1
     )
     for kv_cache_config in kv_cache_configs:
-        num_blocks_old = kv_cache_config.num_blocks
-        kv_cache_config.num_blocks = min_num_blocks
+        # Shrink each per-layer tensor according to *its own group's* min.
+        # `kv_cache_tensors` aligns 1:1 with the per-layer order produced by
+        # `get_kv_cache_config_from_groups`: groups in order, layers within
+        # each group in order. Walk both lists in lockstep to scale each
+        # tensor by the right per-group ratio.
+        if num_groups > 0:
+            tensor_idx = 0
+            for gi, group in enumerate(kv_cache_config.kv_cache_groups):
+                num_blocks_old = kv_cache_config.get_num_blocks(gi)
+                num_blocks_new = min_num_blocks_per_group[gi]
+                for _layer in group.layer_names:
+                    tensor = kv_cache_config.kv_cache_tensors[tensor_idx]
+                    if num_blocks_old > 0:
+                        assert tensor.size % num_blocks_old == 0
+                        tensor.size = tensor.size // num_blocks_old * num_blocks_new
+                    tensor_idx += 1
 
-        # Shrink tensor size proportionally
-        for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+        kv_cache_config.num_blocks_per_group = min_num_blocks_per_group
+        kv_cache_config.num_blocks = min_num_blocks_total
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)

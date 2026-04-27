@@ -140,7 +140,14 @@ class KVCacheManager:
             metrics_collector=self.metrics_collector,
         )
         self.num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
+        # `block_pool` is the legacy single-pool reference; with KANB-91 the
+        # coordinator owns one BlockPool per group via `block_pools`. Single-
+        # pool consumers below are progressively migrated. Eviction-by-block-id
+        # APIs (evict_blocks, reset_prefix_cache) still route through the
+        # primary pool — multi-pool routing requires a global block_id
+        # namespace and is tracked as a follow-up.
         self.block_pool = self.coordinator.block_pool
+        self.block_pools = self.coordinator.block_pools
         self.kv_cache_config = kv_cache_config
 
         # Pre-constructed KVCacheBlocks with no blocks, callers should use this
@@ -157,9 +164,14 @@ class KVCacheManager:
         """Get the KV cache usage.
 
         Returns:
-            The KV cache usage (between 0.0 and 1.0).
+            The KV cache usage (between 0.0 and 1.0). With per-group pools,
+            reports the maximum (worst-utilized) across pools — a single
+            saturated pool means the system can't accept more requests even
+            if other pools have headroom.
         """
-        return self.block_pool.get_usage()
+        if not self.block_pools:
+            return 0.0
+        return max(pool.get_usage() for pool in self.block_pools)
 
     def make_prefix_cache_stats(self) -> PrefixCacheStats | None:
         """Get (and reset) the prefix cache stats.
@@ -252,7 +264,15 @@ class KVCacheManager:
             num_tokens_main_model=full_num_tokens,
         )
 
-        return num_blocks_to_allocate <= self.block_pool.get_num_free_blocks()
+        # NOTE(KANB-91): under per-group pools the coordinator's
+        # `get_num_blocks_to_allocate` sums per-manager counts. Comparing that
+        # sum against summed free across pools is the existing semantic; it's
+        # exact when every group's per-request block demand and pool size are
+        # equal (the historical uniform-page case) and conservative-ish for
+        # heterogeneous groups. Per-pool feasibility checks land in the
+        # follow-up that introduces a global block-id namespace.
+        total_free = sum(pool.get_num_free_blocks() for pool in self.block_pools)
+        return num_blocks_to_allocate <= total_free
 
     def allocate_slots(
         self,
@@ -384,7 +404,8 @@ class KVCacheManager:
             num_tokens_main_model=num_tokens_main_model,
         )
 
-        if num_blocks_to_allocate > self.block_pool.get_num_free_blocks():
+        total_free = sum(pool.get_num_free_blocks() for pool in self.block_pools)
+        if num_blocks_to_allocate > total_free:
             # Cannot allocate new blocks
             return None
 
@@ -466,7 +487,13 @@ class KVCacheManager:
             bool: True if the prefix cache is successfully reset,
             False otherwise.
         """
-        if not self.block_pool.reset_prefix_cache():
+        # Reset every per-group pool. Succeed iff all pools succeeded; if any
+        # pool reports blocks-still-in-use, the overall reset is rejected.
+        all_ok = True
+        for pool in self.block_pools:
+            if not pool.reset_prefix_cache():
+                all_ok = False
+        if not all_ok:
             return False
         if self.log_stats:
             assert self.prefix_cache_stats is not None
@@ -508,12 +535,15 @@ class KVCacheManager:
         return self.coordinator.get_num_common_prefix_blocks(running_request_id)
 
     def take_events(self) -> list[KVCacheEvent]:
-        """Take the KV cache events from the block pool.
+        """Take the KV cache events from every per-group block pool.
 
-        Returns:
-            A list of KV cache events.
+        Events carry a ``group_idx`` field so downstream consumers can
+        disambiguate events that originated from different pools.
         """
-        return self.block_pool.take_events()
+        events: list[KVCacheEvent] = []
+        for pool in self.block_pools:
+            events.extend(pool.take_events())
+        return events
 
     def get_blocks(self, request_id: str) -> KVCacheBlocks:
         """Get the blocks of a request."""

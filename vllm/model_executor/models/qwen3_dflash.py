@@ -243,12 +243,23 @@ class DFlashQwen3Model(nn.Module):
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
+        # Forward the parent vllm_config's cache_config so the drafter's
+        # Attention layers inherit the same kv-cache dtype as the target
+        # model. Without this, Attention(cache_config=None) silently falls
+        # back to kv_cache_dtype="auto", which produces a different
+        # KVCacheSpec type than the target — breaking page-size unification
+        # when the target uses a non-default kv-cache dtype like
+        # turboquant_*. We deliberately do NOT forward quant_config: the
+        # drafter checkpoint has its own (typically lower) weight precision
+        # and applying the target's weight-quant scheme to drafter weights
+        # produces an activation/weight dtype mismatch in the matmul.
         self.layers = nn.ModuleList(
             [
                 DFlashQwen3DecoderLayer(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    cache_config=current_vllm_config.cache_config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]

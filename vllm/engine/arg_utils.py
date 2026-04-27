@@ -1671,26 +1671,38 @@ class EngineArgs:
 
         # TurboQuant: auto-skip first/last 2 layers (boundary protection).
         # These layers are most sensitive to quantization error.
-        # Users can add extra layers via --kv-cache-dtype-skip-layers.
-        if resolved_cache_dtype.startswith("turboquant_"):
-            if model_config.is_hybrid:
-                raise NotImplementedError(
-                    "TurboQuant KV cache is not supported for hybrid "
-                    "(attention + Mamba) models. Boundary layer protection "
-                    "requires uniform attention layers."
-                )
+        #
+        # Apply auto-boundary protection only when the user has NOT supplied
+        # an explicit ``--kv-cache-dtype-skip-layers`` list. The explicit
+        # list is the way hybrid (attention + Mamba/linear) models opt out
+        # of TQ on their non-attention layer indices: the user enumerates
+        # those layers and assumes ownership of which layers are TQ'd vs
+        # native. Naively merging boundary indices into a user-supplied
+        # list silently demotes the last attention layer to standard
+        # ``FullAttentionSpec`` whenever its index happens to fall in the
+        # boundary set, producing a single rogue spec at runtime that
+        # breaks KV-cache page-size unification.
+        #
+        # The previous hybrid-model NotImplementedError is dropped: the
+        # rest of the engine (KV-cache groups, page-size unification,
+        # the auto-aligned Mamba page padding) handles hybrid+TQ when the
+        # user enumerates the non-attention layers themselves.
+        if (
+            resolved_cache_dtype.startswith("turboquant_")
+            and not cache_config.kv_cache_dtype_skip_layers
+        ):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
             num_layers = model_config.hf_text_config.num_hidden_layers
             boundary = TurboQuantConfig.get_boundary_skip_layers(num_layers)
-            existing = set(cache_config.kv_cache_dtype_skip_layers)
-            merged = sorted(existing | set(boundary), key=lambda x: int(x))
-            cache_config.kv_cache_dtype_skip_layers = merged
+            cache_config.kv_cache_dtype_skip_layers = sorted(
+                set(boundary), key=lambda x: int(x)
+            )
             logger.info(
-                "TQ: skipping layers %s for boundary protection (num_layers=%d)",
-                merged,
+                "TQ: auto-skipping boundary layers %s (num_layers=%d)",
+                cache_config.kv_cache_dtype_skip_layers,
                 num_layers,
             )
 

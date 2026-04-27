@@ -243,8 +243,34 @@ class Attention(nn.Module, AttentionLayerBase):
             and kv_cache_scheme.get("strategy") == "attn_head"
         )
 
-        # Skip quantization for specified layers
-        if cache_config is not None and cache_config.kv_cache_dtype_skip_layers:
+        # Skip quantization for specified layers.
+        #
+        # ``kv_cache_dtype_skip_layers`` is semantically a *target-model* layer
+        # filter: it lists indices of layers in the user's model that should
+        # NOT receive the configured kv-cache quantization (e.g. linear-attention
+        # layers in a hybrid model that don't share the standard KV-cache
+        # contract). The matching is done by the integer extracted from the
+        # layer's prefix, so it has no way to distinguish a target layer at
+        # index N from a draft-model layer that happens to also be at index N.
+        # Applying the filter to the draft model produces a mix of TQ and
+        # native specs across the joint kv-cache, which then trips
+        # ``unify_kv_cache_spec_page_size`` (target TQ pages vs draft BF16
+        # pages are not integer multiples).
+        #
+        # We gate the skip check on ``compilation.backends.model_tag``: it is
+        # ``"backbone"`` while the target model is being constructed, and
+        # something else (e.g. ``"eagle_head"``, ``"draft_model"``) inside a
+        # speculative-decoding drafter's ``set_model_tag`` context. That gives
+        # us a clean signal without threading an explicit ``is_draft`` flag
+        # through every model that supports speculative decoding.
+        from vllm.compilation.backends import model_tag as _current_model_tag
+
+        is_draft_model = _current_model_tag != "backbone"
+        if (
+            cache_config is not None
+            and cache_config.kv_cache_dtype_skip_layers
+            and not is_draft_model
+        ):
             from vllm.model_executor.models.utils import extract_layer_index
 
             skip = False

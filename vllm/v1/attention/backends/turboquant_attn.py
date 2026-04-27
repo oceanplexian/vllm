@@ -189,6 +189,14 @@ class TurboQuantMetadata(AttentionMetadata):
     num_decodes: int = 0  # number of decode requests (first in batch)
     num_decode_tokens: int = 0  # tokens from decode requests
     causal: bool = True  # set to False for tree-style spec-decode verify (DFlash)
+    # CPU-resident copies of query_start_loc / seq_lens. Pinned-memory tensors
+    # produced upstream by the metadata pipeline. The continuation-chunk
+    # prefill loop in `_prefill_attention` reads these via `.tolist()` to
+    # build per-request Python int slices without forcing a GPU→CPU sync —
+    # which is forbidden inside CUDA graph capture (the dflash drafter's
+    # spec-decode prefill goes through that loop during graph capture).
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu: torch.Tensor | None = None
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -233,6 +241,8 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             causal=cam.causal,
+            query_start_loc_cpu=cam.query_start_loc_cpu,
+            seq_lens_cpu=getattr(cam, "seq_lens_cpu", None),
         )
 
 
@@ -581,10 +591,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
 
-        # Convert to Python lists once (single CPU-GPU sync) instead of
-        # per-request .item() calls that each force a sync.
-        qsl = query_start_loc.tolist()
-        seq_lens_list = attn_metadata.seq_lens.tolist()
+        # Convert to Python lists once. Prefer CPU-resident copies populated
+        # upstream by the metadata pipeline so the .tolist() call is purely
+        # host-side — which is required because this loop runs inside CUDA
+        # graph capture for the dflash drafter's spec-decode prefill, and
+        # GPU→CPU copies during capture are illegal unless the CPU buffer
+        # is pinned. Falls back to a host-side copy via .cpu() when the CPU
+        # tensors aren't supplied (eager / non-capturing paths).
+        if attn_metadata.query_start_loc_cpu is not None:
+            qsl = attn_metadata.query_start_loc_cpu.tolist()
+        else:
+            qsl = query_start_loc.cpu().tolist()
+        if attn_metadata.seq_lens_cpu is not None:
+            seq_lens_list = attn_metadata.seq_lens_cpu.tolist()
+        else:
+            seq_lens_list = attn_metadata.seq_lens.cpu().tolist()
 
         # Pre-allocate cu_seqlens for single-request flash_attn calls
         # to avoid per-request host→device tensor creation.

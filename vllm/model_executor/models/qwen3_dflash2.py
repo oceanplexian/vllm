@@ -7,6 +7,7 @@ from functools import cache
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import Qwen3Config
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
@@ -56,22 +57,11 @@ def _flashinfer_topk() -> Callable[..., tuple[torch.Tensor, torch.Tensor]] | Non
     return top_k
 
 
-_flashinfer_topk_failed = False
-
-
 def _topk(scores: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    global _flashinfer_topk_failed
     impl = _flashinfer_topk()
-    if impl is not None and not _flashinfer_topk_failed and scores.is_cuda:
-        try:
-            return impl(scores, k, sorted=True, deterministic=True)
-        except Exception:
-            _flashinfer_topk_failed = True
-            logger.warning_once(
-                "FlashInfer radix top-k unavailable; falling back to torch.topk "
-                "at roughly half the speed."
-            )
-    return torch.topk(scores, k, dim=-1)
+    if impl is None or not scores.is_cuda:
+        return torch.topk(scores, k, dim=-1)
+    return impl(scores, k, sorted=True, deterministic=True)
 
 
 def _grouped_conv(
@@ -160,7 +150,7 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         self,
         vllm_config: VllmConfig,
         *,
-        config,
+        config: Qwen3Config,
         layer_idx: int,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
